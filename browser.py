@@ -1,58 +1,23 @@
-import os.path
 import socket
 import ssl
-import time
 import tkinter
 import tkinter.font
 
-from functools import wraps
-from pathlib import Path
-from typing import Literal, Optional
-
-WIDTH, HEIGHT = 800, 600
-HSTEP, VSTEP = 13, 18
-SCROLL_STEP = 100
-
-def timed(name: str):
-    def inner(func):
-        @wraps(func)
-        def wrapped(*args, **kwargs):
-            start = time.perf_counter()
-            result = func(*args, **kwargs)
-            end = time.perf_counter()
-            print(f"Time to {name}: {(end - start) * 1000:.2f}ms")
-            return result
-        return wrapped
-    return inner
-
-FONTS = {}
-
-def get_font(size, weight, slant):
-    key = (size, weight, slant)
-    if key not in FONTS:
-        font = tkinter.font.Font(size=size, weight=weight, slant=slant)
-        FONTS[key] = font
-    return FONTS[key]
-
-def parse_url(url: str) -> tuple[str, str, str]:
+def parse_url(url):
     scheme, url = url.split("://", 1)
-    if "/" not in url: url = url + "/"
+    if "/" not in url:
+        url = url + "/"
     host, path = url.split("/", 1)
     return (scheme, host, "/" + path)
 
-def format_headers(headers: dict) -> bytes:
-    lines = "".join("{}: {}\r\n".format(k, v) for k, v in headers.items())
-    return lines.encode("utf8")
-
-def request(url: str, headers: Optional[dict] = None) -> tuple[dict, str]:
-    if headers is None:
-        headers = {}
-
+def request(url):
     scheme, host, path = parse_url(url)
+    assert scheme in ["http", "https"], "Unknown scheme {}".format(scheme)
+
     port = 80 if scheme == "http" else 443
     if ":" in host:
-        host, port_str = host.split(":", 1)
-        port = int(port_str)
+        host, port = host.split(":", 1)
+        port = int(port)
 
     s = socket.socket(
         family=socket.AF_INET,
@@ -62,15 +27,9 @@ def request(url: str, headers: Optional[dict] = None) -> tuple[dict, str]:
     if scheme == "https":
         ctx = ssl.create_default_context()
         s = ctx.wrap_socket(s, server_hostname=host)
-
     s.connect((host, port))
-    
-    headers['Host'] = host
-    headers['Connection'] = 'close'
-    headers.setdefault('User-Agent', 'MyBrowser/0.1')
-
-    s.send("GET {} HTTP/1.1\r\n".format(path).encode("utf8") + 
-        format_headers(headers) + b"\r\n")
+    s.send("GET {} HTTP/1.0\r\n".format(path).encode("utf8") + 
+        "Host: {}\r\n\r\n".format(host).encode("utf8"))
 
     response = s.makefile("r", encoding="utf8", newline="\r\n")
     statusline = response.readline()
@@ -92,65 +51,144 @@ def request(url: str, headers: Optional[dict] = None) -> tuple[dict, str]:
 
     return headers, body
 
-def load_file(path: str) -> str:
-    path = os.path.normpath(path)
-    return Path(path).read_text()
+WIDTH, HEIGHT = 800, 600
+HSTEP, VSTEP = 13, 18
+SCROLL_STEP = 100
 
-def load_document(url: str) -> str:
-    scheme, rest = url.split("://", 1)
-    assert scheme in ["http", "https", "file"], "Unknown scheme {scheme}"
-    if scheme == "file":
-        return load_file(rest)
-    _, body = request(url)
-    return body
+FONTS = {}
 
-def show(body: str) -> None:
-    in_angle = False
-    for c in body:
-        if c == "<":
-            in_angle = True
-        elif c == ">":
-            in_angle = False
-        elif not in_angle:
-            print(c, end="")
+def get_font(size, weight, slant):
+    key = (size, weight, slant)
+    if key not in FONTS:
+        font = tkinter.font.Font(size=size, weight=weight, slant=slant)
+        FONTS[key] = font
+    return FONTS[key]
 
 class Text:
-    def __init__(self, text):
+    def __init__(self, text, parent):
         self.text = text
+        self.children = []
+        self.parent = parent
 
-class Tag:
-    def __init__(self, tag):
+    def __repr__(self):
+        return repr(self.text)
+
+class Element:
+    def __init__(self, tag, attributes, parent):
         self.tag = tag
+        self.children = []
+        self.attributes = attributes
+        self.parent = parent
 
-def lex(body: str) -> list[Tag | Text]:
-    out: list[Tag | Text] = []
-    text = ""
-    in_tag = False
-    for c in body:
-        if c == "<":
-            in_tag = True
-            if text: out.append(Text(text))
-            text = ""
-        elif c == ">":
-            in_tag = False
-            out.append(Tag(text))
-            text = ""
+    def __repr__(self):
+        return "<" + self.tag + ">"
+
+
+def print_tree(node, indent=0):
+    print(" " * indent, node)
+    for child in node.children:
+        print_tree(child, indent + 2)
+
+class HTMLParser:
+    def __init__(self, body):
+        self.body = body
+        self.unfinished = []
+
+    def get_attributes(self, text):
+        parts = text.split()
+        tag = parts[0].lower()
+        attributes = {}
+        for attrpair in parts[1:]:
+            if "=" in attrpair:
+                key, value = attrpair.split("=", 1)
+                if len(value) > 2 and value[0] in ["'", "\""]:
+                    value = value[1:-1]
+                attributes[key.lower()] = value
+            else:
+                attributes[attrpair.lower()] = ""
+        return tag, attributes
+
+    def add_text(self, text):
+        if text.isspace(): return
+        self.implicit_tags(None)
+        parent = self.unfinished[-1]
+        node = Text(text, parent)
+        parent.children.append(node)
+
+    SELF_CLOSING_TAGS = [
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    ]
+
+    def add_tag(self, tag):
+        tag, attributes = self.get_attributes(tag)
+        if tag.startswith("!"): return
+        self.implicit_tags(tag)
+        if tag.startswith("/"):
+            if len(self.unfinished) == 1: return
+            node = self.unfinished.pop()
+            parent = self.unfinished[-1]
+            parent.children.append(node)
+        elif tag in self.SELF_CLOSING_TAGS:
+            parent = self.unfinished[-1]
+            node = Element(tag, attributes, parent)
+            parent.children.append(node)
         else:
-            text += c
-    if not in_tag and text:
-        out.append(Text(text))
-    return out
+            parent = self.unfinished[-1] if self.unfinished else None
+            node = Element(tag, attributes, parent)
+            self.unfinished.append(node)
+
+    HEAD_TAGS = [
+        "base", "basefont", "bgsound", "noscript",
+        "link", "meta", "title", "style", "script",
+    ]
+
+    def implicit_tags(self, tag):
+        while True:
+            open_tags = [node.tag for node in self.unfinished]
+            if open_tags == [] and tag != "html":
+                self.add_tag("html")
+            elif open_tags == ["html"] \
+                 and tag not in ["head", "body", "/html"]:
+                if tag in self.HEAD_TAGS:
+                    self.add_tag("head")
+                else:
+                    self.add_tag("body")
+            elif open_tags == ["html", "head"] and \
+                 tag not in ["/head"] + self.HEAD_TAGS:
+                self.add_tag("/head")
+            else:
+                break
+
+    def finish(self):
+        if len(self.unfinished) == 0:
+            self.add_tag("html")
+        while len(self.unfinished) > 1:
+            node = self.unfinished.pop()
+            parent = self.unfinished[-1]
+            parent.children.append(node)
+        return self.unfinished.pop()
+
+    def parse(self):
+        text = ""
+        in_tag = False
+        for c in self.body:
+            if c == "<":
+                in_tag = True
+                if text: self.add_text(text)
+                text = ""
+            elif c == ">":
+                in_tag = False
+                self.add_tag(text)
+                text = ""
+            else:
+                text += c
+        if not in_tag and text:
+            self.add_text(text)
+        return self.finish()
 
 class Layout:
-    display_list: list
-    weight: Literal["normal" , "bold"]
-    style: Literal["roman" , "italic"]
-    cursor_x: float
-    cursor_y: float
-    line: list
-
-    @timed("layout")
-    def __init__(self, tokens: list[Tag | Text]) -> None:
+    def __init__(self, nodes):
         self.display_list = []
         self.cursor_x = HSTEP
         self.cursor_y = VSTEP
@@ -159,11 +197,44 @@ class Layout:
         self.size = 16
         self.line = []
 
-        for tok in tokens:
-            self.token(tok)
+        self.recurse(nodes)
         self.flush()
 
-    def text(self, tok: Text) -> None:
+    def open_tag(self, tag):
+        if tag == "i":
+            self.style = "italic"
+        elif tag == "b":
+            self.weight = "bold"
+        elif tag == "small":
+            self.size -= 2
+        elif tag == "big":
+            self.size += 4
+        elif tag == "br":
+            self.flush()
+
+    def close_tag(self, tag):
+        if tag == "i":
+            self.style = "roman"
+        elif tag == "b":
+            self.weight = "normal"
+        elif tag == "small":
+            self.size += 2
+        elif tag == "big":
+            self.size -= 4
+        elif tag == "p":
+            self.flush()
+            self.cursor_y += VSTEP
+
+    def recurse(self, tree):
+        if isinstance(tree, Text):
+            self.text(tree)
+        else:
+            self.open_tag(tree.tag)
+            for child in tree.children:
+                self.recurse(child)
+            self.close_tag(tree.tag)
+
+    def text(self, tok):
         font = get_font(self.size, self.weight, self.style)
         for word in tok.text.split():
             w = font.measure(word)
@@ -172,7 +243,7 @@ class Layout:
             self.line.append((self.cursor_x, word, font))
             self.cursor_x += w + font.measure(" ")
 
-    def flush(self) -> None:
+    def flush(self):
         if not self.line: return
         metrics = [font.metrics() for _, _, font in self.line]
         max_ascent = max([metric["ascent"] for metric in metrics])
@@ -185,35 +256,11 @@ class Layout:
         max_descent = max([metric["descent"] for metric in metrics])
         self.cursor_y = baseline + 1.25 * max_descent
 
-    def token(self, tok: Tag | Text) -> None:
-        if isinstance(tok, Text):
-            self.text(tok)
-        elif tok.tag == "i":
-            self.style = "italic"
-        elif tok.tag == "/i":
-            self.style = "roman"
-        elif tok.tag == "b":
-            self.weight = "bold"
-        elif tok.tag == "/b":
-            self.weight = "normal"
-        elif tok.tag == "small":
-            self.size -= 2
-        elif tok.tag == "/small":
-            self.size += 2
-        elif tok.tag == "big":
-            self.size += 4
-        elif tok.tag == "/big":
-            self.size -= 4
-        elif tok.tag == "br":
-            self.flush()
-        elif tok.tag == "/p":
-            self.flush()
-            self.cursor_y += VSTEP
 
 class Browser:
 
     def __init__(self):
-        self.display_list = None
+        self.display_list = []
         self.scroll = 0
         self.window = tkinter.Tk()
         self.canvas = tkinter.Canvas(
@@ -223,25 +270,14 @@ class Browser:
         )
         self.canvas.pack()
         self.window.bind("<Down>", self.scrolldown)
-        self.window.bind("<Up>", self.scrollup)
 
-    def scrolldown(self, e):
-        self.scroll += SCROLL_STEP
+    def load(self, url):
+        _, body = request(url)
+        self.nodes = HTMLParser(body).parse()
+        self.display_list = Layout(self.nodes).display_list
         self.draw()
 
-    def scrollup(self, e):
-        if self.scroll > 0:
-            self.scroll -= SCROLL_STEP
-            self.draw()
-
-    def load(self, url: str) -> None:
-        document = load_document(url)
-        tokens = lex(document)
-        self.display_list = Layout(tokens).display_list
-        self.draw()
-
-    @timed("draw")
-    def draw(self) -> None:
+    def draw(self):
         self.canvas.delete("all")
         for x, y, word, font in self.display_list:
             if y > self.scroll + HEIGHT: continue
@@ -254,9 +290,11 @@ class Browser:
                 anchor="nw"
             )
 
-DEFAULT_URL = "file:///Users/jacob/src/browser-engineering/test.html"
+    def scrolldown(self, _):
+        self.scroll += SCROLL_STEP
+        self.draw()
 
 if __name__ == "__main__":
     import sys
-    Browser().load(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_URL)
+    Browser().load(sys.argv[1])
     tkinter.mainloop()
