@@ -150,8 +150,8 @@ class HTMLParser:
     }
 
     def add_text(self, text: str):
-        # pre = bool(self.unfinished) and self.unfinished[-1].tag == "pre"
-        # if text.isspace() and not pre: return
+        preformatted = any(node.tag == "pre" for node in self.unfinished)
+        if text.isspace() and not preformatted: return
         self.implicit_tags(None)
         offset = 0
         while True:
@@ -497,12 +497,29 @@ class BlockLayout:
     def text(self, node):
         color = node.style["color"]
         font = self.get_font(node)
-        for word in node.text.split():
-            w = font.measure(word)
-            if self.cursor_x + w > self.width:
-                self.flush()
-            self.line.append((self.cursor_x, word, font, color))
-            self.cursor_x += w + font.measure(" ")
+        if isinstance(self.node, Element) and self.node.tag == "pre":
+            offset = 0
+            while offset < len(node.text):
+                newline_idx = node.text.find("\n")
+                if newline_idx == -1:
+                    run_end = len(node.text)
+                else:
+                    run_end = newline_idx
+                run = node.text[offset:run_end]
+                if run:
+                    w = font.measure(run)
+                    self.line.append((self.cursor_x, run, font, color))
+                    self.cursor_x += w
+                if newline_idx != -1:
+                    self.flush()
+                offset = run_end + 1
+        else:
+            for word in node.text.split():
+                w = font.measure(word)
+                if self.cursor_x + w > self.width:
+                    self.flush()
+                self.line.append((self.cursor_x, word, font, color))
+                self.cursor_x += w + font.measure(" ")
 
     def flush(self):
         if not self.line: return
